@@ -1,6 +1,7 @@
 package altair
 
 import (
+	"context"
 	"math"
 	"testing"
 
@@ -9,6 +10,7 @@ import (
 	state_native "github.com/OffchainLabs/prysm/v6/beacon-chain/state/state-native"
 	"github.com/OffchainLabs/prysm/v6/config/params"
 	"github.com/OffchainLabs/prysm/v6/consensus-types/primitives"
+	mathutil "github.com/OffchainLabs/prysm/v6/math"
 	ethpb "github.com/OffchainLabs/prysm/v6/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v6/testing/assert"
 	"github.com/OffchainLabs/prysm/v6/testing/require"
@@ -279,6 +281,85 @@ func TestAttestationsDeltaBellatrix(t *testing.T) {
 	require.DeepEqual(t, want, rewards)
 	want = []uint64{3577700, 2325505, 0, 0}
 	require.DeepEqual(t, want, penalties)
+}
+
+func TestAttestationsDelta_LargeEffectiveBalance(t *testing.T) {
+	params.SetupTestConfigCleanup(t)
+	cfg := params.BeaconConfig()
+	// Use an exaggerated max effective balance (10,000,000 ETH in gwei)
+	cfg.MaxEffectiveBalance = 10_000_000 * cfg.GweiPerEth
+	params.OverrideBeaconConfig(cfg)
+
+	valCount := 1024
+	effBal := cfg.MaxEffectiveBalance
+	slot := 2 * cfg.SlotsPerEpoch
+
+	// Build full participation (source, target, head) for all validators in both epochs.
+	full := byte(0)
+	var err error
+	full, err = AddValidatorFlag(full, cfg.TimelySourceFlagIndex)
+	require.NoError(t, err)
+	full, err = AddValidatorFlag(full, cfg.TimelyTargetFlagIndex)
+	require.NoError(t, err)
+	full, err = AddValidatorFlag(full, cfg.TimelyHeadFlagIndex)
+	require.NoError(t, err)
+
+	validators := make([]*ethpb.Validator, 0, valCount)
+	balances := make([]uint64, 0, valCount)
+	participation := make([]byte, 0, valCount)
+	for i := 0; i < valCount; i++ {
+		validators = append(validators, &ethpb.Validator{
+			EffectiveBalance:  effBal,
+			ExitEpoch:         cfg.FarFutureEpoch,
+			WithdrawableEpoch: cfg.FarFutureEpoch,
+		})
+		balances = append(balances, 0)
+		participation = append(participation, full)
+	}
+
+	st, err := state_native.InitializeFromProtoAltair(&ethpb.BeaconStateAltair{
+		Slot:                       slot,
+		Validators:                 validators,
+		CurrentEpochParticipation:  participation,
+		PreviousEpochParticipation: participation,
+		InactivityScores:           make([]uint64, valCount),
+		Balances:                   balances,
+	})
+	require.NoError(t, err)
+
+	vals, bal, err := InitializePrecomputeValidators(context.Background(), st)
+	require.NoError(t, err)
+	vals, bal, err = ProcessEpochParticipation(context.Background(), st, bal, vals)
+	require.NoError(t, err)
+	deltas, err := AttestationsDelta(st, bal, vals)
+	require.NoError(t, err)
+
+	// Compute the expected rewards
+	// Perfect participation: all validators attest with all flags, so attested_balance == active_balance
+	// and each reward term reduces to baseReward * componentWeight / weightDenominator.
+	increment := cfg.EffectiveBalanceIncrement
+	factor := cfg.BaseRewardFactor
+	active := uint64(valCount) * effBal
+	baseRewardMultiplier := increment * factor / mathutil.CachedSquareRoot(active)
+	baseReward := (effBal / increment) * baseRewardMultiplier
+	expectedHeadReward := baseReward * cfg.TimelyHeadWeight / cfg.WeightDenominator
+	expectedSourceReward := baseReward * cfg.TimelySourceWeight / cfg.WeightDenominator
+	expectedTargetReward := baseReward * cfg.TimelyTargetWeight / cfg.WeightDenominator
+
+	require.Equal(t, true, expectedHeadReward > 0)
+	require.Equal(t, true, expectedSourceReward > 0)
+	require.Equal(t, true, expectedTargetReward > 0)
+
+	// All validators identical; verify each head reward matches expectation and no field overflowed.
+	for _, d := range deltas {
+		require.Equal(t, expectedHeadReward, d.HeadReward)
+		require.Equal(t, expectedSourceReward, d.SourceReward)
+		require.Equal(t, expectedTargetReward, d.TargetReward)
+		// No penalties expected.
+		require.Equal(t, uint64(0), d.SourcePenalty)
+		require.Equal(t, uint64(0), d.TargetPenalty)
+		require.Equal(t, uint64(0), d.InactivityPenalty)
+	}
 }
 
 func TestProcessRewardsAndPenaltiesPrecompute_Ok(t *testing.T) {
