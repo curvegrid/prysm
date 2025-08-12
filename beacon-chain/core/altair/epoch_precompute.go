@@ -320,8 +320,8 @@ func attestationDelta(
 	// Process source reward / penalty
 	if val.IsPrevEpochSourceAttester && !val.IsSlashed {
 		if !inactivityLeak {
-			n := baseReward * srcWeight * (bal.PrevEpochAttested / increment)
-			attDelta.SourceReward += n / (activeIncrement * weightDenominator)
+			n := (baseReward * srcWeight) / weightDenominator * (bal.PrevEpochAttested / increment)
+			attDelta.SourceReward += n / activeIncrement
 		}
 	} else {
 		attDelta.SourcePenalty += baseReward * srcWeight / weightDenominator
@@ -330,8 +330,8 @@ func attestationDelta(
 	// Process target reward / penalty
 	if val.IsPrevEpochTargetAttester && !val.IsSlashed {
 		if !inactivityLeak {
-			n := baseReward * tgtWeight * (bal.PrevEpochTargetAttested / increment)
-			attDelta.TargetReward += n / (activeIncrement * weightDenominator)
+			n := (baseReward * tgtWeight) / weightDenominator * (bal.PrevEpochTargetAttested / increment)
+			attDelta.TargetReward += n / activeIncrement
 		}
 	} else {
 		attDelta.TargetPenalty += baseReward * tgtWeight / weightDenominator
@@ -340,8 +340,8 @@ func attestationDelta(
 	// Process head reward / penalty
 	if val.IsPrevEpochHeadAttester && !val.IsSlashed {
 		if !inactivityLeak {
-			n := baseReward * headWeight * (bal.PrevEpochHeadAttested / increment)
-			attDelta.HeadReward += n / (activeIncrement * weightDenominator)
+			n := (baseReward * headWeight) / weightDenominator * (bal.PrevEpochHeadAttested / increment)
+			attDelta.HeadReward += n / activeIncrement
 		}
 	}
 
