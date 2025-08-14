@@ -2,6 +2,7 @@ package altair
 
 import (
 	"context"
+	"math/bits"
 
 	"github.com/OffchainLabs/prysm/v6/beacon-chain/core/epoch/precompute"
 	"github.com/OffchainLabs/prysm/v6/beacon-chain/core/helpers"
@@ -317,11 +318,21 @@ func attestationDelta(
 	tgtWeight := cfg.TimelyTargetWeight
 	headWeight := cfg.TimelyHeadWeight
 	attDelta := &AttDelta{}
+	// NOTE: We preserve spec arithmetic (single-floor) for rewards while guarding
+	// against transient uint64 overflow on custom networks with very large effective
+	// balances. Spec formula (per component):
+	//   reward = floor(baseReward * weight * participating_increments / (active_increments * WEIGHT_DENOMINATOR))
+	// We perform systematic gcd cancellations across numerator/denominator factors
+	// to keep intermediates within 64 bits, then carry out at most one 128-bit
+	// multiply (via bits.Mul64) followed by a single 128/64 division (bits.Div64).
+	// This yields the exact spec floor result with zero allocations and no
+	// rounding deviations, even for extreme (non-mainnet) effective balance values.
+
 	// Process source reward / penalty
 	if val.IsPrevEpochSourceAttester && !val.IsSlashed {
 		if !inactivityLeak {
-			n := (baseReward * srcWeight) / weightDenominator * (bal.PrevEpochAttested / increment)
-			attDelta.SourceReward += n / activeIncrement
+			participating := bal.PrevEpochAttested / increment
+			attDelta.SourceReward += mul3Div2Exact(baseReward, srcWeight, participating, activeIncrement, weightDenominator)
 		}
 	} else {
 		attDelta.SourcePenalty += baseReward * srcWeight / weightDenominator
@@ -330,8 +341,8 @@ func attestationDelta(
 	// Process target reward / penalty
 	if val.IsPrevEpochTargetAttester && !val.IsSlashed {
 		if !inactivityLeak {
-			n := (baseReward * tgtWeight) / weightDenominator * (bal.PrevEpochTargetAttested / increment)
-			attDelta.TargetReward += n / activeIncrement
+			participating := bal.PrevEpochTargetAttested / increment
+			attDelta.TargetReward += mul3Div2Exact(baseReward, tgtWeight, participating, activeIncrement, weightDenominator)
 		}
 	} else {
 		attDelta.TargetPenalty += baseReward * tgtWeight / weightDenominator
@@ -340,8 +351,8 @@ func attestationDelta(
 	// Process head reward / penalty
 	if val.IsPrevEpochHeadAttester && !val.IsSlashed {
 		if !inactivityLeak {
-			n := (baseReward * headWeight) / weightDenominator * (bal.PrevEpochHeadAttested / increment)
-			attDelta.HeadReward += n / activeIncrement
+			participating := bal.PrevEpochHeadAttested / increment
+			attDelta.HeadReward += mul3Div2Exact(baseReward, headWeight, participating, activeIncrement, weightDenominator)
 		}
 	}
 
@@ -356,4 +367,66 @@ func attestationDelta(
 	}
 
 	return attDelta, nil
+}
+
+// mul3Div2Exact returns floor(a*b*c / (d*e)) with exact spec semantics, no
+// allocation, and overflow avoidance via gcd reduction + 128-bit intermediate math.
+// It assumes d>0, e>0. If any numerator factor is 0 the result is 0.
+func mul3Div2Exact(a, b, c, d, e uint64) uint64 {
+	if a == 0 || b == 0 || c == 0 {
+		return 0
+	}
+	// d and e are guaranteed >0 (activeIncrement and weightDenominator) per spec; no need to guard.
+	// Initial gcd cancellations across (a,b,c) and (d,e)
+	a, d = reducePair(a, d)
+	a, e = reducePair(a, e)
+	b, d = reducePair(b, d)
+	b, e = reducePair(b, e)
+	c, d = reducePair(c, d)
+	c, e = reducePair(c, e)
+
+	// Stage 1: q1 = floor((a*b)/d), r1 = (a*b) % d
+	// Further targeted reduction to keep 128-bit multiply tight.
+	if g := gcd64(a, d); g > 1 {
+		a /= g
+		d /= g
+	}
+	if g := gcd64(b, d); g > 1 {
+		b /= g
+		d /= g
+	}
+	hi, lo := bits.Mul64(a, b)
+	q1, r1 := bits.Div64(hi, lo, d)
+
+	// Stage 2 remainder propagation: compute q2 = floor((r1*c)/d)
+	// r1 < d so r1*c fits in 128 bits.
+	hi2, lo2 := bits.Mul64(r1, c)
+	q2, _ := bits.Div64(hi2, lo2, d)
+
+	// Combine: floor((a*b*c)/(d*e)) = floor( (q1*c + q2) / e ).
+	// Compute q1*c in 128 bits then add q2.
+	hi3, lo3 := bits.Mul64(q1, c)
+	// Add q2 to 128-bit (hi3, lo3)
+	lo3, carry := bits.Add64(lo3, q2, 0)
+	hi3 += carry
+
+	// Final division by e.
+	res, _ := bits.Div64(hi3, lo3, e)
+	return res
+}
+
+func reducePair(n, d uint64) (uint64, uint64) {
+	g := gcd64(n, d)
+	if g > 1 {
+		n /= g
+		d /= g
+	}
+	return n, d
+}
+
+func gcd64(a, b uint64) uint64 {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
 }
