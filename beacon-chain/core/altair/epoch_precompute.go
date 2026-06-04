@@ -274,6 +274,31 @@ func AttestationsDelta(beaconState state.BeaconState, bal *precompute.Balance, v
 	baseRewardMultiplier := increment * factor / math.CachedSquareRoot(bal.ActiveCurrentEpoch)
 	leak := helpers.IsInInactivityLeak(prevEpoch, finalizedEpoch)
 
+	// Logarithmic issuance adjustment (reward halving schedule):
+	// We halve positive issuance (rewards) every 5 years while keeping penalties
+	// unchanged so security incentives remain intact as issuance trends to 0.
+	// This is intentionally local (no config struct changes) for minimal rebasing surface.
+	// Schedule: 0-5y: 20%, 5-10y: 10%, 10-15y: 5%, ...
+	// Implemented by right-shifting reward numerators by rewardShift = epoch / epochsPerHalving.
+	currentEpoch := time.CurrentEpoch(beaconState)
+	secondsPerEpoch := cfg.SecondsPerSlot * uint64(cfg.SlotsPerEpoch)
+	const secondsPerYear uint64 = 31536000 // 365*24*3600 (leap-years ignored for determinism)
+	var rewardShift uint64
+	if secondsPerEpoch > 0 {
+		epochsPerYear := secondsPerYear / secondsPerEpoch
+		if epochsPerYear == 0 { // extremely short epoch edge-case guard
+			epochsPerYear = 1
+		}
+		epochsPerHalving := epochsPerYear * 5
+		if epochsPerHalving > 0 { // compute halving index
+			rewardShift = uint64(currentEpoch) / epochsPerHalving
+			// Cap shift to avoid very large shifts causing compiler or consensus surprises.
+			if rewardShift > 60 { // >2^60 practically zero already
+				rewardShift = 60
+			}
+		}
+	}
+
 	// Modified in Altair and Bellatrix.
 	bias := cfg.InactivityScoreBias
 	inactivityPenaltyQuotient, err := beaconState.InactivityPenaltyQuotient()
@@ -283,7 +308,7 @@ func AttestationsDelta(beaconState state.BeaconState, bal *precompute.Balance, v
 	inactivityDenominator := bias * inactivityPenaltyQuotient
 
 	for i, v := range vals {
-		attDeltas[i], err = attestationDelta(bal, v, baseRewardMultiplier, inactivityDenominator, leak)
+		attDeltas[i], err = attestationDelta(bal, v, baseRewardMultiplier, inactivityDenominator, leak, rewardShift)
 		if err != nil {
 			return nil, err
 		}
@@ -296,7 +321,8 @@ func attestationDelta(
 	bal *precompute.Balance,
 	val *precompute.Validator,
 	baseRewardMultiplier, inactivityDenominator uint64,
-	inactivityLeak bool) (*AttDelta, error) {
+	inactivityLeak bool,
+	rewardShift uint64) (*AttDelta, error) {
 	eligible := val.IsActivePrevEpoch || (val.IsSlashed && !val.IsWithdrawableCurrentEpoch)
 	// Per spec `ActiveCurrentEpoch` can't be 0 to process attestation delta.
 	if !eligible || bal.ActiveCurrentEpoch == 0 {
@@ -318,6 +344,9 @@ func attestationDelta(
 	if val.IsPrevEpochSourceAttester && !val.IsSlashed {
 		if !inactivityLeak {
 			n := baseReward * srcWeight * (bal.PrevEpochAttested / increment)
+			if rewardShift > 0 {
+				n >>= rewardShift
+			}
 			attDelta.SourceReward += n / (activeIncrement * weightDenominator)
 		}
 	} else {
@@ -328,6 +357,9 @@ func attestationDelta(
 	if val.IsPrevEpochTargetAttester && !val.IsSlashed {
 		if !inactivityLeak {
 			n := baseReward * tgtWeight * (bal.PrevEpochTargetAttested / increment)
+			if rewardShift > 0 {
+				n >>= rewardShift
+			}
 			attDelta.TargetReward += n / (activeIncrement * weightDenominator)
 		}
 	} else {
@@ -338,6 +370,9 @@ func attestationDelta(
 	if val.IsPrevEpochHeadAttester && !val.IsSlashed {
 		if !inactivityLeak {
 			n := baseReward * headWeight * (bal.PrevEpochHeadAttested / increment)
+			if rewardShift > 0 {
+				n >>= rewardShift
+			}
 			attDelta.HeadReward += n / (activeIncrement * weightDenominator)
 		}
 	}
